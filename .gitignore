@@ -47,3 +47,27 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# --- Spécifique au projet ---
+
+# IDE JetBrains (PyCharm / IntelliJ)
+.idea/
+
+# renv : bibliothèque locale
+renv/library/
+renv/staging/
+
+# Données (brutes et transformées, non versionnées)
+data/raw/
+data/processed/
+
+# Modèles entraînés et checkpoints
+models/
+*.h5
+*.keras
+*.rds
+
+# Fichiers volumineux / système
+*.parquet
+.DS_Store
+Thumbs.db
