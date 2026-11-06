@@ -72,6 +72,21 @@ Ou avec `renv` :
 renv::restore()
 ```
 
+## 📥 Récupération des données
+
+Le script [`scripts/fetch_data.R`](scripts/fetch_data.R) télécharge la consommation électrique nationale française (éCO2mix, RTE) depuis la plateforme [ODRÉ](https://odre.opendatasoft.com/), **sans clé d'API** :
+
+- `eco2mix-national-cons-def` : données définitives et consolidées, pas de 30 min, depuis 2012 ;
+- `eco2mix-national-tr` : données temps réel (pas de 15 min) pour la période non encore consolidée.
+
+```bash
+Rscript scripts/fetch_data.R            # tout l'historique (2012 -> aujourd'hui)
+Rscript scripts/fetch_data.R 2020       # à partir de 2020
+Rscript scripts/fetch_data.R --force    # retélécharge même les années en cache
+```
+
+Les fichiers annuels sont écrits dans `data/raw/eco2mix/` et assemblés dans `data/raw/eco2mix_national.csv` (horodatage UTC). Les années déjà consolidées ne sont pas retéléchargées.
+
 ## 📈 Résultats attendus
 Le modèle prédit la consommation d’électricité avec une bonne précision et permet d’analyser les tendances à court et long terme. L’application Shiny permet de visualiser les prévisions.
 

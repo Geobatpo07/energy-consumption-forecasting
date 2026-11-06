@@ -58,11 +58,14 @@ renv/library/
 renv/staging/
 
 # Données (brutes et transformées, non versionnées)
-data/raw/
-data/processed/
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
 
 # Modèles entraînés et checkpoints
-models/
+models/*
+!models/.gitkeep
 *.h5
 *.keras
 *.rds
