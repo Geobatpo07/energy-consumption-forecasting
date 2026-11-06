@@ -74,3 +74,8 @@ models/*
 *.parquet
 .DS_Store
 Thumbs.db
+
+# Rendus des notebooks (régénérables)
+notebooks/*.html
+notebooks/*.md
+notebooks/figures/

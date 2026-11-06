@@ -1,0 +1,386 @@
+---
+title: "01 — Analyse exploratoire de la consommation électrique française"
+subtitle: "Données éCO2mix (RTE), 2012 → aujourd'hui"
+author: "Geovany Batista Polo LAGUERRE"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 4.5, dpi = 110,
+                      fig.path = "figures/01_exploration/")
+# Les chemins sont relatifs à la racine du projet.
+knitr::opts_knit$set(root.dir = normalizePath(
+  file.path(dirname(knitr::current_input(dir = TRUE)), "..")))
+```
+
+```{r packages}
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(lubridate)
+  library(tsibble)
+  library(feasts)
+  library(scales)
+})
+
+theme_set(theme_minimal(base_size = 12) +
+            theme(plot.title.position = "plot",
+                  panel.grid.minor = element_blank()))
+
+TZ_LOCAL <- "Europe/Paris"
+# Libellés explicites : indépendants de la locale du système.
+MOIS_FR  <- c("janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août",
+              "sept.", "oct.", "nov.", "déc.")
+JOURS_FR <- c("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
+mois_fr  <- function(x) factor(month(x), levels = 1:12, labels = MOIS_FR)
+jour_fr  <- function(x) factor(wday(x, week_start = 1), levels = 1:7, labels = JOURS_FR)
+fmt_gw   <- label_number(accuracy = 1, suffix = " GW", scale = 1e-3)
+```
+
+**Objectif.** Comprendre la structure de la série de consommation (tendance, saisonnalités, ruptures, qualité des données) afin de guider le prétraitement (`02_preprocessing.R`) et le choix des modèles (`03_modeling.R`).
+
+Les données sont produites par `scripts/fetch_data.R`. Les valeurs sont des **puissances moyennes en MW** sur chaque pas de temps.
+
+# Chargement et qualité des données
+
+```{r load}
+raw <- read_csv("data/raw/eco2mix_national.csv",
+                col_types = cols(date_heure = col_datetime(), nature = col_character(),
+                                 .default = col_double()),
+                locale = locale(tz = "UTC"))
+
+raw |>
+  group_by(nature) |>
+  summarise(debut = min(date_heure), fin = max(date_heure), lignes = n(),
+            .groups = "drop") |>
+  arrange(debut)
+```
+
+## Pas de temps
+
+```{r resolution}
+raw |>
+  arrange(date_heure) |>
+  mutate(pas_min = as.numeric(difftime(lead(date_heure), date_heure, units = "mins"))) |>
+  count(nature, pas_min, name = "occurrences") |>
+  filter(!is.na(pas_min)) |>
+  group_by(nature) |>
+  slice_max(occurrences, n = 3) |>
+  ungroup()
+```
+
+Les données définitives et consolidées sont au pas de **30 min**, les données temps réel au pas de **15 min**. Pour obtenir une série homogène, on agrège au pas de 30 min (moyenne des puissances), puis au pas horaire pour la modélisation.
+
+```{r harmonise}
+conso_30 <- raw |>
+  mutate(date_heure = floor_date(date_heure, "30 minutes")) |>
+  group_by(date_heure) |>
+  summarise(across(c(consommation, prevision_j1, prevision_j), \(x) mean(x, na.rm = TRUE)),
+            nature = first(nature), n_obs = n(), .groups = "drop") |>
+  mutate(across(where(is.numeric), \(x) ifelse(is.nan(x), NA, x))) |>
+  as_tsibble(index = date_heure)
+
+gaps <- count_gaps(conso_30)
+```
+
+## Valeurs manquantes
+
+```{r gaps}
+tibble(
+  indicateur = c("Pas de 30 min attendus", "Pas présents",
+                 "Trous (séquences manquantes)", "Pas manquants",
+                 "Prévision J-1 manquante", "Prévision J manquante"),
+  valeur = c(nrow(conso_30) + sum(gaps$.n), nrow(conso_30), nrow(gaps), sum(gaps$.n),
+             sum(is.na(conso_30$prevision_j1)), sum(is.na(conso_30$prevision_j)))
+)
+
+gaps |> arrange(desc(.n)) |> head(10) |>
+  rename(debut = .from, fin = .to, pas_manquants = .n)
+```
+
+Les trous sont rares et courts. Ils tombent presque tous **la nuit du passage à l'heure d'hiver** (dernier dimanche d'octobre, 00:00–00:30 UTC) : l'heure locale répétée (2 h–3 h) est absente de la source. Une **interpolation linéaire** suffira au prétraitement.
+
+## Série horaire et calendrier
+
+On construit la série horaire (index UTC, pour éviter les doublons au changement d'heure) et on ajoute les variables calendaires en **heure locale**, qui est l'heure qui pilote les usages.
+
+```{r hourly}
+conso_h <- conso_30 |>
+  as_tibble() |>
+  mutate(date_heure = floor_date(date_heure, "hour")) |>
+  group_by(date_heure) |>
+  summarise(conso = mean(consommation, na.rm = TRUE), .groups = "drop") |>
+  filter(!is.nan(conso)) |>
+  mutate(local   = with_tz(date_heure, TZ_LOCAL),
+         date    = as_date(local),
+         annee   = year(local),
+         mois    = mois_fr(local),
+         heure   = hour(local),
+         jour    = jour_fr(local),
+         saison  = case_when(month(local) %in% c(12, 1, 2) ~ "Hiver",
+                             month(local) %in% 3:5         ~ "Printemps",
+                             month(local) %in% 6:8         ~ "Été",
+                             TRUE                          ~ "Automne"),
+         saison  = factor(saison, levels = c("Hiver", "Printemps", "Été", "Automne")))
+
+# Série journalière (jours complets uniquement)
+conso_j <- conso_h |>
+  group_by(date) |>
+  summarise(conso = mean(conso), n_h = n(), .groups = "drop") |>
+  filter(n_h >= 23) |>
+  select(-n_h)
+```
+
+# Vue d'ensemble
+
+```{r overview, fig.height = 5}
+conso_j |>
+  mutate(tendance = as.numeric(stats::filter(conso, rep(1 / 365, 365), sides = 2))) |>
+  ggplot(aes(date)) +
+  geom_line(aes(y = conso), colour = "grey60", linewidth = 0.25) +
+  geom_line(aes(y = tendance), colour = "#1f5fa8", linewidth = 0.9, na.rm = TRUE) +
+  scale_y_continuous(labels = fmt_gw) +
+  labs(title = "Consommation journalière moyenne en France",
+       subtitle = "Gris : moyenne journalière — Bleu : moyenne mobile centrée sur 365 jours",
+       x = NULL, y = NULL)
+```
+
+```{r annual}
+annuel <- conso_h |>
+  group_by(annee) |>
+  summarise(conso_moy = mean(conso), heures = n(), .groups = "drop") |>
+  filter(heures >= 8700) |>                       # années complètes
+  mutate(energie_TWh = conso_moy * 8760 / 1e6,
+         evolution = conso_moy / lag(conso_moy) - 1)
+
+ggplot(annuel, aes(factor(annee), energie_TWh)) +
+  geom_col(fill = "#1f5fa8") +
+  geom_text(aes(label = round(energie_TWh)), vjust = -0.4, size = 3.2) +
+  labs(title = "Consommation annuelle (années complètes)",
+       subtitle = "Énergie approximée : puissance moyenne × 8 760 h",
+       x = NULL, y = "TWh")
+
+annuel |>
+  mutate(conso_moy = round(conso_moy), energie_TWh = round(energie_TWh, 1),
+         evolution = percent(evolution, accuracy = 0.1)) |>
+  select(annee, conso_moy_MW = conso_moy, energie_TWh, evolution)
+```
+
+# Saisonnalités
+
+## Saisonnalité annuelle
+
+```{r yearly-season}
+conso_j |>
+  mutate(mois = mois_fr(date)) |>
+  ggplot(aes(mois, conso)) +
+  geom_boxplot(fill = "#cfe0f3", outlier.size = 0.4) +
+  scale_y_continuous(labels = fmt_gw) +
+  labs(title = "Distribution de la consommation journalière par mois",
+       x = NULL, y = NULL)
+```
+
+## Saisonnalité hebdomadaire et journalière
+
+```{r weekly-daily, fig.height = 5}
+conso_h |>
+  filter(annee >= max(annee) - 2) |>
+  group_by(saison, jour, heure) |>
+  summarise(conso = mean(conso), .groups = "drop") |>
+  ggplot(aes(heure, conso, colour = jour)) +
+  geom_line(linewidth = 0.7) +
+  facet_wrap(~ saison, nrow = 1) +
+  scale_x_continuous(breaks = c(0, 6, 12, 18, 23)) +
+  scale_y_continuous(labels = fmt_gw) +
+  scale_colour_manual(values = c(rep("#9bb8d9", 4), "#1f5fa8", "#e08a1e", "#c0392b")) +
+  labs(title = "Profil journalier moyen par jour de la semaine et par saison",
+       subtitle = "3 dernières années — heure locale",
+       x = "Heure", y = NULL, colour = NULL)
+```
+
+```{r heatmap, fig.height = 4.5}
+conso_h |>
+  group_by(mois, heure) |>
+  summarise(conso = mean(conso), .groups = "drop") |>
+  ggplot(aes(heure, mois, fill = conso)) +
+  geom_tile() +
+  scale_fill_viridis_c(labels = fmt_gw, option = "C") +
+  scale_x_continuous(breaks = seq(0, 23, 3), expand = c(0, 0)) +
+  labs(title = "Consommation moyenne par heure et par mois", x = "Heure locale",
+       y = NULL, fill = NULL)
+```
+
+## Jours fériés
+
+Les jours fériés se comportent comme des dimanches : c'est une variable explicative indispensable.
+
+```{r holidays}
+# Jours fériés en France métropolitaine (Pâques par l'algorithme de Meeus).
+paques <- function(y) {
+  a <- y %% 19; b <- y %/% 100; c <- y %% 100; d <- b %/% 4; e <- b %% 4
+  f <- (b + 8) %/% 25; g <- (b - f + 1) %/% 3; h <- (19 * a + b - d - g + 15) %% 30
+  i <- c %/% 4; k <- c %% 4; l <- (32 + 2 * e + 2 * i - h - k) %% 7
+  m <- (a + 11 * h + 22 * l) %/% 451
+  mois <- (h + l - 7 * m + 114) %/% 31; jour <- ((h + l - 7 * m + 114) %% 31) + 1
+  make_date(y, mois, jour)
+}
+jours_feries <- function(annees) {
+  do.call(c, lapply(annees, function(y) {
+    p <- paques(y)
+    c(make_date(y, 1, 1), p + 1, make_date(y, 5, 1), make_date(y, 5, 8), p + 39,
+      p + 50, make_date(y, 7, 14), make_date(y, 8, 15), make_date(y, 11, 1),
+      make_date(y, 11, 11), make_date(y, 12, 25))
+  }))
+}
+
+feries <- jours_feries(unique(year(conso_j$date)))
+
+conso_j |>
+  mutate(jour = wday(date, week_start = 1),
+         type = case_when(date %in% feries ~ "Jour férié (lun.–ven.)",
+                          jour == 7        ~ "Dimanche",
+                          jour == 6        ~ "Samedi",
+                          TRUE             ~ "Jour ouvré")) |>
+  filter(!(date %in% feries & jour >= 6)) |>
+  # On compare à la moyenne des 4 semaines autour pour neutraliser la saison.
+  mutate(ref = as.numeric(stats::filter(conso, rep(1 / 29, 29), sides = 2)),
+         ratio = conso / ref) |>
+  filter(!is.na(ratio)) |>
+  group_by(type) |>
+  summarise(`écart vs moyenne mobile 29 j` = percent(mean(ratio) - 1, accuracy = 0.1),
+            jours = n(), .groups = "drop") |>
+  arrange(desc(jours))
+```
+
+# Décomposition et autocorrélation
+
+## Décomposition STL (série journalière)
+
+```{r stl, fig.height = 7}
+conso_j_ts <- conso_j |>
+  as_tsibble(index = date) |>
+  fill_gaps() |>
+  mutate(conso = approx(seq_along(conso), conso, xout = seq_along(conso))$y)
+
+stl_fit <- conso_j_ts |>
+  model(STL(conso ~ season(period = "week") + season(period = "year"), robust = TRUE))
+
+components(stl_fit) |>
+  autoplot(linewidth = 0.3) +
+  labs(title = "Décomposition STL : tendance + saisonnalités hebdomadaire et annuelle",
+       x = NULL)
+```
+
+```{r stl-strength}
+# Force d'une composante (Wang, Smith & Hyndman, 2006) : 1 - Var(R) / Var(C + R),
+# entre 0 (absente) et 1 (dominante).
+force <- function(comp, reste) max(0, 1 - var(reste) / var(comp + reste))
+
+cmp <- components(stl_fit)
+tibble(
+  composante = c("Tendance", "Saisonnalité hebdomadaire", "Saisonnalité annuelle"),
+  force = round(c(force(cmp$trend, cmp$remainder),
+                  force(cmp$season_week, cmp$remainder),
+                  force(cmp$season_year, cmp$remainder)), 3)
+)
+```
+
+## Autocorrélation (série horaire)
+
+```{r acf}
+conso_h |>
+  filter(annee >= max(annee) - 2) |>
+  select(date_heure, conso) |>
+  as_tsibble(index = date_heure) |>
+  fill_gaps() |>
+  mutate(conso = approx(seq_along(conso), conso, xout = seq_along(conso))$y) |>
+  ACF(conso, lag_max = 24 * 8) |>
+  as_tibble() |>
+  mutate(lag = as.numeric(lag)) |>
+  ggplot(aes(lag, acf)) +
+  geom_segment(aes(xend = lag, yend = 0), colour = "#1f5fa8") +
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = c(24, 168), linetype = "dashed", colour = "#c0392b") +
+  scale_x_continuous(breaks = seq(0, 192, 24)) +
+  labs(title = "Autocorrélation de la série horaire (3 dernières années)",
+       subtitle = "Pics à 24 h (cycle journalier) et 168 h (cycle hebdomadaire)",
+       x = "Décalage (heures)")
+```
+
+# Distribution et extrêmes
+
+```{r distribution}
+ggplot(conso_h, aes(conso)) +
+  geom_histogram(bins = 80, fill = "#1f5fa8", colour = "white", linewidth = 0.1) +
+  scale_x_continuous(labels = fmt_gw) +
+  labs(title = "Distribution de la consommation horaire", x = NULL, y = "Heures")
+
+conso_h |>
+  slice_max(conso, n = 8) |>
+  transmute(`date (heure locale)` = format(local, "%Y-%m-%d %Hh"),
+            `consommation (MW)` = round(conso))
+```
+
+La distribution est **bimodale** (régime estival / régime hivernal) et les pointes ont lieu les soirs d'hiver par grand froid. La consommation française est très **thermosensible** à cause du chauffage électrique : intégrer la **température** sera déterminant.
+
+# Référence : prévisions de RTE
+
+RTE publie ses propres prévisions la veille (J-1) et le jour même (J). Ce sont les références à battre.
+
+L'erreur augmente nettement **à partir de 2023**, qui coïncide avec la baisse de consommation liée à la sobriété énergétique et à la crise des prix. Les comportements sont devenus plus difficiles à prévoir. La référence pertinente est donc celle des **années récentes**, pas la moyenne historique.
+
+```{r benchmark}
+erreurs <- conso_30 |>
+  as_tibble() |>
+  filter(!is.na(consommation)) |>
+  mutate(annee = year(with_tz(date_heure, TZ_LOCAL))) |>
+  pivot_longer(c(prevision_j1, prevision_j), names_to = "prevision", values_to = "prev") |>
+  filter(!is.na(prev)) |>
+  mutate(prevision = recode(prevision, prevision_j1 = "RTE J-1", prevision_j = "RTE J"),
+         err = prev - consommation)
+
+erreurs |>
+  mutate(periode = if_else(annee <= 2022, "2012–2022", "2023 →")) |>
+  group_by(periode, prevision) |>
+  summarise(MAE_MW = round(mean(abs(err))),
+            RMSE_MW = round(sqrt(mean(err^2))),
+            MAPE = percent(mean(abs(err) / consommation), accuracy = 0.01),
+            .groups = "drop")
+
+erreurs |>
+  group_by(prevision, annee) |>
+  summarise(MAPE = mean(abs(err) / consommation), .groups = "drop") |>
+  ggplot(aes(annee, MAPE, colour = prevision)) +
+  geom_line(linewidth = 0.8) + geom_point() +
+  scale_y_continuous(labels = label_percent(accuracy = 0.1), limits = c(0, NA)) +
+  scale_x_continuous(breaks = pretty_breaks()) +
+  scale_colour_manual(values = c("RTE J-1" = "#1f5fa8", "RTE J" = "#e08a1e")) +
+  labs(title = "Erreur des prévisions RTE (MAPE) par année", x = NULL, y = NULL,
+       colour = NULL)
+```
+
+# Conclusions pour la modélisation
+
+```{r summary-values, include=FALSE}
+mape_j1_recent <- erreurs |> filter(prevision == "RTE J-1", annee >= 2023) |>
+  summarise(m = mean(abs(err) / consommation)) |> pull(m)
+mape_j1_ancien <- erreurs |> filter(prevision == "RTE J-1", annee <= 2022) |>
+  summarise(m = mean(abs(err) / consommation)) |> pull(m)
+```
+
+1. **Qualité des données** : série quasi complète (`r sum(gaps$.n)` pas de 30 min manquants sur `r format(nrow(conso_30) + sum(gaps$.n), big.mark = " ")`, surtout au changement d'heure d'octobre). Il faut harmoniser le pas de temps (30 min / 15 min) et interpoler les trous courts.
+2. **Saisonnalités multiples** : journalière (24 h), hebdomadaire (168 h) et annuelle. La saisonnalité annuelle domine (force STL ≈ `r round(force(cmp$season_year, cmp$remainder), 2)`). Ces saisonnalités sont imbriquées : le profil journalier change selon la saison (double pointe matin / soir en hiver) et le type de jour (samedi ≈ −6 %, dimanche et jours fériés ≈ −10 %).
+3. **Variables explicatives à construire** : heure, jour de la semaine, mois / jour de l'année (encodage cyclique sin/cos), jours fériés et ponts, vacances, et surtout la **température** (données météo à ajouter). Le résidu STL est nettement plus fort en hiver, ce qui est la signature de la thermosensibilité. L'année 2014, particulièrement douce, est en recul de 6 %.
+4. **Ruptures de régime** : la tendance n'est pas stationnaire (crise sanitaire de 2020, baisse liée à la sobriété énergétique à partir de l'hiver 2022-2023). Les années récentes sont les plus représentatives : il faut un découpage **chronologique** train / validation / test, avec un test sur la période la plus récente.
+5. **Fenêtres d'entrée des RNN** : l'autocorrélation montre qu'une fenêtre d'au moins **168 h** (une semaine) est pertinente pour capter les deux cycles courts.
+6. **Objectif chiffré** : la prévision J-1 de RTE affiche un MAPE d'environ **`r percent(mape_j1_recent, accuracy = 0.1)` depuis 2023** (contre `r percent(mape_j1_ancien, accuracy = 0.1)` sur 2012–2022). C'est la référence à battre (ou approcher) pour un horizon de 24 h. Elle utilise des prévisions météo, ce que nos modèles devront aussi intégrer pour être compétitifs.
